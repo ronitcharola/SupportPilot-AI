@@ -1,0 +1,115 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: supportpilot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: supportpilot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d supportpilot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: supportpilot-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: supportpilot-backend
+    restart: unless-stopped
+    # Apply migrations and seed idempotent demo data before serving traffic.
+    command: >
+      sh -c "alembic upgrade head &&
+             python scripts/seed.py &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - DEMO_MODE=true
+      - SECRET_KEY=dev-super-secret-key-change-in-production-min-32-chars-supportpilot
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/supportpilot
+      - REDIS_URL=redis://redis:6379/0
+      - LLM_PROVIDER=mock
+      - LLM_MODEL=mock-gpt-4o
+      - EMBEDDING_PROVIDER=mock
+      - EMBEDDING_DIMENSION=1536
+      - SIMILARITY_THRESHOLD=0.72
+      - MOCK_SIMILARITY_THRESHOLD=0.12
+      - KNOWLEDGE_INGESTION_MODE=celery
+      - MAX_UPLOAD_BYTES=5242880
+      - FRONTEND_URL=http://localhost:3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend/uploads:/app/uploads
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: supportpilot-worker
+    restart: unless-stopped
+    command: celery -A app.tasks.celery_app:celery_app worker --loglevel=info
+    environment:
+      - ENVIRONMENT=development
+      - DEMO_MODE=true
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/supportpilot
+      - REDIS_URL=redis://redis:6379/0
+      - LLM_PROVIDER=mock
+      - LLM_MODEL=mock-gpt-4o
+      - EMBEDDING_PROVIDER=mock
+      - EMBEDDING_DIMENSION=1536
+      - MOCK_SIMILARITY_THRESHOLD=0.12
+      - KNOWLEDGE_INGESTION_MODE=celery
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend/uploads:/app/uploads
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    container_name: supportpilot-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  redisdata:
